@@ -1,0 +1,8 @@
+# Environment and OS noise
+.env
+.DS_Store
+
+# Python artifacts
+__pycache__/
+*.pyc
+.venv/
