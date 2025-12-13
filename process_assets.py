@@ -215,6 +215,7 @@ def retexture_image(model: genai.GenerativeModel, asset: Path, swatch: Path, out
         "Retexture the product in the first image using the material from the second image. "
         "Use the first image as the exact base: same resolution, framing, camera angle, silhouette, proportions, dimensions, crop, lighting, and background. "
         "Do NOT move/rotate/zoom the camera; do NOT change object dimensions or perspective; do NOT add/remove/alter any geometry. "
+        "Do NOT add any new objects/props (no pillows, rugs, blankets, accessories) and keep the floor clear. "
         "Do NOT paste or show the swatch as a square patch; retexture the product surfaces only while keeping the product visible. "
         "Apply the swatch to every wood/primary surface (including interior/underside of legs, side panels, edges); leave no original wood visible. "
         "Background must remain identical to the first image; no swatch text/watermark/ghosting anywhere. "
