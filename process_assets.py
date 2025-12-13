@@ -1,7 +1,6 @@
 import base64
 import io
 import os
-import re
 from pathlib import Path
 from typing import List
 
@@ -10,6 +9,8 @@ from dotenv import load_dotenv
 from PIL import Image, ImageStat
 
 
+load_dotenv()
+
 BASE_DIR = Path(__file__).parent
 TEST_ASSETS_DIR = BASE_DIR / "test_assets"
 SWATCHES_DIR = BASE_DIR / "swatches"
@@ -17,9 +18,11 @@ OUTPUT_DIR = BASE_DIR / "output"
 
 # File types that we will convert to PNG alongside already-present PNGs.
 CONVERTIBLE_EXTENSIONS = {".tif", ".tiff", ".jpg", ".jpeg", ".webp"}
-MAX_DIMENSION = 4096
 ENABLE_RETEXTURE = os.getenv("ENABLE_RETEXTURE", "1").lower() not in {"0", "false", "no"}
-REQUEST_MAX_DIMENSION = int(os.getenv("REQUEST_MAX_DIMENSION", "2048"))
+ASSET_MAX_DIMENSION = int(os.getenv("ASSET_MAX_DIMENSION", "8192"))
+SWATCH_MAX_DIMENSION = int(os.getenv("SWATCH_MAX_DIMENSION", "4096"))
+CONVERT_MAX_DIMENSION = int(os.getenv("CONVERT_MAX_DIMENSION", str(max(ASSET_MAX_DIMENSION, SWATCH_MAX_DIMENSION))))
+OUTPUT_TARGET_DIMENSION = int(os.getenv("OUTPUT_TARGET_DIMENSION", "4096"))
 EXCLUDED_SWATCH_SUBSTRINGS = ("_bump", "_color", "_disp", "_spec", "_roughness")
 GREY_CARD_TARGET_VALUE = 118.0  # Approximate sRGB value for 18% gray.
 GREY_CARD_MAX_NEUTRAL = 14.0
@@ -31,7 +34,7 @@ GREY_CARD_MAX_FACTOR = 1.6
 Image.MAX_IMAGE_PIXELS = None
 
 
-def convert_folder_to_png(folder: Path) -> List[Path]:
+def convert_folder_to_png(folder: Path, max_dimension: int | None = None) -> List[Path]:
     """Convert images in a folder to PNG and return the PNG paths."""
     pngs: List[Path] = []
     seen: set[Path] = set()
@@ -53,12 +56,13 @@ def convert_folder_to_png(folder: Path) -> List[Path]:
                 pngs.append(output_path)
                 seen.add(output_path)
             continue
+        effective_max = max_dimension if max_dimension is not None else CONVERT_MAX_DIMENSION
         try:
             with Image.open(path) as img:
                 # Normalize to RGBA so we keep any transparency and avoid palette issues.
                 converted = img.convert("RGBA")
-                if max(converted.size) > MAX_DIMENSION:
-                    converted.thumbnail((MAX_DIMENSION, MAX_DIMENSION), Image.LANCZOS)
+                if effective_max and max(converted.size) > effective_max:
+                    converted.thumbnail((effective_max, effective_max), Image.LANCZOS)
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 converted.save(output_path)
             if output_path not in seen:
@@ -71,7 +75,6 @@ def convert_folder_to_png(folder: Path) -> List[Path]:
 
 
 def configure_model() -> genai.GenerativeModel:
-    load_dotenv()
     api_key = os.getenv("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_MODEL", "models/gemini-3-pro-image-preview")
     if not api_key:
@@ -153,14 +156,15 @@ def calibrate_to_grey_card(image: Image.Image) -> Image.Image:
     return Image.merge("RGBA", (r, g, b, alpha))
 
 
-def inline_image(path: Path, calibrate_grey_card: bool = False) -> dict:
+def inline_image(path: Path, *, calibrate_grey_card: bool = False, max_dimension: int | None = None) -> dict:
     """Load a PNG and downscale for the request payload if needed."""
     with Image.open(path) as img:
         converted = img.convert("RGBA")
         if calibrate_grey_card:
             converted = calibrate_to_grey_card(converted)
-        if REQUEST_MAX_DIMENSION and max(converted.size) > REQUEST_MAX_DIMENSION:
-            converted.thumbnail((REQUEST_MAX_DIMENSION, REQUEST_MAX_DIMENSION), Image.LANCZOS)
+        effective_max = max_dimension or ASSET_MAX_DIMENSION
+        if effective_max and max(converted.size) > effective_max:
+            converted.thumbnail((effective_max, effective_max), Image.LANCZOS)
         buffer = io.BytesIO()
         converted.save(buffer, format="PNG")
         return {"mime_type": "image/png", "data": buffer.getvalue()}
@@ -181,7 +185,32 @@ def extract_image_bytes(response) -> bytes:
     raise RuntimeError("No inline image data found in the response.")
 
 
+def enforce_output_resolution(image_bytes: bytes, target_max_dimension: int) -> bytes:
+    """
+    Ensure the returned image hits the requested max dimension (default 4K) by upscaling if needed.
+    This preserves transparency by operating in RGBA.
+    """
+    if not target_max_dimension or target_max_dimension <= 0:
+        return image_bytes
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as img:
+            base = img.convert("RGBA")
+            width, height = base.size
+            max_dim = max(width, height)
+            if max_dim >= target_max_dimension:
+                return image_bytes
+            scale = target_max_dimension / max_dim
+            new_size = (int(round(width * scale)), int(round(height * scale)))
+            upscaled = base.resize(new_size, Image.LANCZOS)
+            buffer = io.BytesIO()
+            upscaled.save(buffer, format="PNG")
+            return buffer.getvalue()
+    except Exception:  # pragma: no cover - defensive guardrail
+        return image_bytes
+
+
 def retexture_image(model: genai.GenerativeModel, asset: Path, swatch: Path, output_path: Path) -> None:
+    swatch_hint = describe_swatch(swatch)
     prompt = (
         "Retexture the product in the first image using the material from the second image. "
         "Use the first image as the exact base: same resolution, framing, camera angle, silhouette, proportions, dimensions, crop, lighting, and background. "
@@ -200,21 +229,23 @@ def retexture_image(model: genai.GenerativeModel, asset: Path, swatch: Path, out
 
     response = model.generate_content(
         [
-            inline_image(asset),
+            inline_image(asset, max_dimension=ASSET_MAX_DIMENSION),
             {"text": "Product to retexture."},
-            inline_image(swatch, calibrate_grey_card=False),
+            inline_image(swatch, calibrate_grey_card=True, max_dimension=SWATCH_MAX_DIMENSION),
             {
                 "text": (
                     "Swatch/material image. Apply this material to every wood surface (including leg interiors/undersides/edges); "
                     "leave any metal/hardware unchanged. Ignore filename words; use only the image."
                 )
             },
+            {"text": swatch_hint},
             {"text": prompt},
         ],
         request_options={"timeout": 600},
     )
 
     image_bytes = extract_image_bytes(response)
+    image_bytes = enforce_output_resolution(image_bytes, OUTPUT_TARGET_DIMENSION)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(image_bytes)
     print(f"Saved retextured image: {output_path}")
@@ -269,8 +300,8 @@ def describe_swatch(swatch: Path) -> str:
 def process_folder(
     model: genai.GenerativeModel, asset_folder: Path, swatch_folder: Path, enable_retexture: bool
 ) -> None:
-    asset_pngs = convert_folder_to_png(asset_folder)
-    swatch_pngs = filter_swatch_pngs(convert_folder_to_png(swatch_folder))
+    asset_pngs = convert_folder_to_png(asset_folder, max_dimension=ASSET_MAX_DIMENSION)
+    swatch_pngs = filter_swatch_pngs(convert_folder_to_png(swatch_folder, max_dimension=SWATCH_MAX_DIMENSION))
 
     if not asset_pngs:
         print(f"[WARN] No assets to process in {asset_folder}")

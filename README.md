@@ -13,3 +13,9 @@ From the project root:
 python3 process_assets.py
 ```
 The script converts assets/swatch images to PNG as needed, calibrates swatch brightness using the 18% gray card if present, and writes outputs to `output/`.
+
+Notes:
+- Product requests stay at up to 8192px on the longest side by default (`ASSET_MAX_DIMENSION` env) so we submit the highest detail the API will accept; swatches are downscaled separately (`SWATCH_MAX_DIMENSION`, default 4096) to balance payload size with detail.
+- Source conversions honor `CONVERT_MAX_DIMENSION` (default: max of asset/swatch limits) so TIFFs/JPEGs become high-res PNGs before sending; assets convert up to `ASSET_MAX_DIMENSION`, swatches up to `SWATCH_MAX_DIMENSION`.
+- Outputs are upscaled to 4K if needed (`OUTPUT_TARGET_DIMENSION`, default 4096) to maintain high-res deliverables.
+- `ENABLE_RETEXTURE=0` skips generation while still running conversions.
